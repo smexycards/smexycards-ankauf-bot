@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+# Runtime data must live on the Railway volume, not in Git.
+data/*.sqlite3
+data/generated/
