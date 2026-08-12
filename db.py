@@ -279,3 +279,48 @@ def set_offer_status(offer_id: int, status: str) -> None:
             "UPDATE offers SET status=?, updated_at=? WHERE id=?",
             (status, _now(), offer_id),
         )
+
+
+def get_dashboard_stats(guild_id: int) -> dict[str, int]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS count FROM tickets WHERE guild_id=? GROUP BY status",
+            (guild_id,),
+        ).fetchall()
+        counts = {str(row["status"]): int(row["count"]) for row in rows}
+        total = conn.execute("SELECT COUNT(*) FROM tickets WHERE guild_id=?", (guild_id,)).fetchone()[0]
+        agreed = conn.execute(
+            """
+            SELECT COALESCE(SUM(agreed_price_cents), 0)
+            FROM tickets
+            WHERE guild_id=? AND agreed_price_cents IS NOT NULL AND status != 'declined'
+            """,
+            (guild_id,),
+        ).fetchone()[0]
+
+    active = sum(counts.get(status, 0) for status in ("open", "offer_pending", "deal", "seller_data", "shipping"))
+    return {
+        "total": int(total),
+        "active": active,
+        "open": counts.get("open", 0),
+        "offer_pending": counts.get("offer_pending", 0),
+        "deal": counts.get("deal", 0),
+        "seller_data": counts.get("seller_data", 0),
+        "shipping": counts.get("shipping", 0),
+        "closed": counts.get("closed", 0),
+        "declined": counts.get("declined", 0),
+        "agreed_price_cents": int(agreed or 0),
+    }
+
+
+def list_recent_tickets(guild_id: int, limit: int = 12, active_only: bool = True) -> list[dict[str, Any]]:
+    where = "guild_id=?"
+    params: list[Any] = [guild_id]
+    if active_only:
+        where += " AND status NOT IN ('closed', 'declined')"
+    with connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM tickets WHERE {where} ORDER BY updated_at DESC, id DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+    return [_ticket_dict(row) for row in rows if row is not None]

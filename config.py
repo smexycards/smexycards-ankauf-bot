@@ -24,6 +24,8 @@ TIMEZONE = ZoneInfo(TIMEZONE_NAME)
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).expanduser()
 DB_PATH = DATA_DIR / "ankauf.sqlite3"
 GENERATED_DIR = DATA_DIR / "generated"
+BACKUP_DIR = DATA_DIR / "backups"
+EXPORT_DIR = DATA_DIR / "exports"
 PDF_TEMPLATE = BASE_DIR / "assets" / "Smexycards_Privates_Ankaufsformular_mit_Kaeuferdaten.pdf"
 
 BRAND_COLOR = 0x182A43
@@ -37,4 +39,6 @@ def validate_config() -> None:
     if not PDF_TEMPLATE.exists():
         raise RuntimeError(f"PDF-Vorlage fehlt: {PDF_TEMPLATE}")
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)

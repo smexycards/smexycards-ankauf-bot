@@ -9,7 +9,7 @@ from typing import Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 import db
 from config import (
@@ -24,6 +24,7 @@ from config import (
     validate_config,
 )
 from pdf_generator import format_eur, generate_prefilled_pdf
+from backup_manager import create_backup_bundle, create_csv_export, create_scheduled_backup, latest_backup
 
 
 def brand_embed(title: str, description: str = "") -> discord.Embed:
@@ -100,6 +101,71 @@ def ticket_kind_label(kind: str) -> str:
 def clean_field(value: object, max_len: int = 1024) -> str:
     text = str(value or "-").strip() or "-"
     return text[:max_len]
+
+
+STATUS_LABELS = {
+    "open": "🟢 Offen",
+    "offer_pending": "🟡 Angebot offen",
+    "deal": "🤝 Deal",
+    "seller_data": "📄 Formular",
+    "shipping": "📦 Versand",
+    "closed": "🔒 Geschlossen",
+    "declined": "❌ Abgelehnt",
+}
+
+
+def status_label(status: str) -> str:
+    return STATUS_LABELS.get(status, f"• {status}")
+
+
+def build_dashboard_embed(guild: discord.Guild) -> discord.Embed:
+    stats = db.get_dashboard_stats(guild.id)
+    tickets = db.list_recent_tickets(guild.id, limit=12, active_only=True)
+
+    embed = brand_embed(
+        "📊 SMEXYCARDS • ANKAUF-DASHBOARD",
+        "Interne Übersicht für das Ankauf-Team. Verkäuferdaten und Exporte bitte vertraulich behandeln.",
+    )
+    embed.add_field(name="🎫 Aktiv", value=str(stats["active"]), inline=True)
+    embed.add_field(name="💶 Angebote offen", value=str(stats["offer_pending"]), inline=True)
+    embed.add_field(name="🤝 Deals / Formular", value=str(stats["deal"] + stats["seller_data"]), inline=True)
+    embed.add_field(name="📦 Versand", value=str(stats["shipping"]), inline=True)
+    embed.add_field(name="🔒 Abgeschlossen", value=str(stats["closed"]), inline=True)
+    embed.add_field(name="❌ Abgelehnt", value=str(stats["declined"]), inline=True)
+    embed.add_field(
+        name="💰 Vereinbarte Ankaufssumme",
+        value=format_eur(stats["agreed_price_cents"]),
+        inline=False,
+    )
+
+    if tickets:
+        lines: list[str] = []
+        for ticket in tickets:
+            channel_text = f"<#{ticket['channel_id']}>" if ticket.get("channel_id") else "ohne Kanal"
+            price = (
+                f" • **{format_eur(int(ticket['agreed_price_cents']))}**"
+                if ticket.get("agreed_price_cents") is not None
+                else ""
+            )
+            owner = clean_field(ticket.get("owner_name"), 40)
+            lines.append(
+                f"{status_label(str(ticket['status']))} • **#{ticket['id']:04d}** • {channel_text} • {owner}{price}"
+            )
+        embed.add_field(name="📋 Zuletzt aktive Tickets", value="\n".join(lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="📋 Zuletzt aktive Tickets", value="Aktuell keine offenen Ankauf-Tickets.", inline=False)
+
+    backup = latest_backup()
+    if backup is not None:
+        try:
+            modified = datetime.fromtimestamp(backup.stat().st_mtime, tz=TIMEZONE).strftime("%d.%m.%Y %H:%M")
+            backup_text = f"Letztes automatisches Backup: **{modified} Uhr**"
+        except OSError:
+            backup_text = "Automatisches Backup vorhanden."
+    else:
+        backup_text = "Noch kein automatisches Backup vorhanden."
+    embed.set_footer(text=f"Smexycards • Insgesamt {stats['total']} Tickets • {backup_text}")
+    return embed
 
 
 async def is_staff(interaction: discord.Interaction) -> bool:
@@ -763,6 +829,78 @@ class DealSellerView(discord.ui.View):
         await interaction.response.send_modal(SellerDataModal())
 
 
+class DashboardView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Aktualisieren", emoji="🔄", style=discord.ButtonStyle.primary)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_staff(interaction):
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Nur auf einem Server verfügbar.", ephemeral=True)
+            return
+        await interaction.response.edit_message(embed=build_dashboard_embed(interaction.guild), view=self)
+
+    @discord.ui.button(label="CSV Export", emoji="📊", style=discord.ButtonStyle.secondary)
+    async def export(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_staff(interaction):
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Nur auf einem Server verfügbar.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        path = await asyncio.to_thread(create_csv_export, interaction.guild.id)
+        try:
+            await interaction.followup.send(
+                "📊 **CSV-Export erstellt.** Die ZIP enthält Tickets, Angebote und Server-Einstellungen. "
+                "Sie kann Verkäufer-/Kontaktdaten enthalten – bitte vertraulich speichern.",
+                file=discord.File(path, filename=path.name),
+                ephemeral=True,
+            )
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+    @discord.ui.button(label="Backup ZIP", emoji="💾", style=discord.ButtonStyle.success)
+    async def backup(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await require_staff(interaction):
+            return
+        if not interaction.guild:
+            await interaction.response.send_message("❌ Nur auf einem Server verfügbar.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        path = await asyncio.to_thread(create_backup_bundle, interaction.guild.id)
+        try:
+            await interaction.followup.send(
+                "💾 **Datenbank-Backup erstellt.** Lade die ZIP herunter und bewahre sie sicher auf. "
+                "Sie enthält die Ankauf-Datenbank einschließlich Verkäuferdaten.",
+                file=discord.File(path, filename=path.name),
+                ephemeral=True,
+            )
+        finally:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+@tasks.loop(hours=24)
+async def automatic_database_backup() -> None:
+    try:
+        path = await asyncio.to_thread(create_scheduled_backup, 14)
+        print(f"💾 Automatisches Datenbank-Backup erstellt: {path.name}")
+    except Exception as exc:
+        print(f"⚠️ Automatisches Datenbank-Backup fehlgeschlagen: {exc}")
+
+
+@automatic_database_backup.before_loop
+async def before_automatic_database_backup() -> None:
+    await bot.wait_until_ready()
+
+
 class SmexycardsBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -790,6 +928,8 @@ bot = SmexycardsBot()
 async def on_ready() -> None:
     print(f"✅ Eingeloggt als {bot.user} (ID: {bot.user.id if bot.user else 'n/a'})")
     print("💰 Smexycards Ankauf-Bot ist bereit.")
+    if not automatic_database_backup.is_running():
+        automatic_database_backup.start()
 
 
 @bot.tree.command(name="ankauf_setup", description="Richtet das Smexycards-Ankauf-Ticketsystem ein.")
@@ -966,6 +1106,64 @@ async def ankauf_panel_update(interaction: discord.Interaction) -> None:
         f"✅ Das Ankauf-Panel wurde aktualisiert: {message.jump_url}",
         ephemeral=True,
     )
+
+
+@bot.tree.command(name="ankauf_dashboard", description="Zeigt das interne Ankauf-Dashboard für das Team.")
+async def ankauf_dashboard(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Nur auf einem Server verfügbar.", ephemeral=True)
+        return
+    if not await require_staff(interaction):
+        return
+    await interaction.response.send_message(
+        embed=build_dashboard_embed(interaction.guild),
+        view=DashboardView(),
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="ankauf_export", description="Exportiert Ankauf-Tickets und Angebote als CSV-ZIP.")
+async def ankauf_export(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Nur auf einem Server verfügbar.", ephemeral=True)
+        return
+    if not await require_staff(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    path = await asyncio.to_thread(create_csv_export, interaction.guild.id)
+    try:
+        await interaction.followup.send(
+            "📊 Export fertig. Die ZIP kann Verkäufer-/Kontaktdaten enthalten – bitte vertraulich behandeln.",
+            file=discord.File(path, filename=path.name),
+            ephemeral=True,
+        )
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+@bot.tree.command(name="ankauf_backup", description="Erstellt ein privates Backup der Ankauf-Datenbank.")
+async def ankauf_backup(interaction: discord.Interaction) -> None:
+    if not interaction.guild:
+        await interaction.response.send_message("❌ Nur auf einem Server verfügbar.", ephemeral=True)
+        return
+    if not await require_staff(interaction):
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    path = await asyncio.to_thread(create_backup_bundle, interaction.guild.id)
+    try:
+        await interaction.followup.send(
+            "💾 Backup fertig. Die ZIP enthält die Ankauf-Datenbank einschließlich Verkäuferdaten – bitte sicher speichern.",
+            file=discord.File(path, filename=path.name),
+            ephemeral=True,
+        )
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
 
 
 @bot.tree.command(name="ankauf_status", description="Zeigt den aktuellen Status dieses Ankauf-Tickets.")
