@@ -211,6 +211,82 @@ async def send_log(guild: discord.Guild, title: str, description: str) -> None:
             pass
 
 
+async def get_or_create_archive_category(
+    guild: discord.Guild, settings: dict
+) -> discord.CategoryChannel:
+    """Return an archive category with free room, creating the next archive if needed."""
+    current = None
+    archive_id = settings.get("archive_category_id")
+    if archive_id:
+        candidate = guild.get_channel(archive_id)
+        if isinstance(candidate, discord.CategoryChannel):
+            current = candidate
+            if len(candidate.channels) < 50:
+                return candidate
+
+    # Reuse any existing numbered Smexycards archive that still has room.
+    archives = [
+        category
+        for category in guild.categories
+        if category.name.startswith("📁 ANKAUF ARCHIV")
+    ]
+    for category in sorted(archives, key=lambda item: item.position, reverse=True):
+        if len(category.channels) < 50:
+            if category.id != archive_id:
+                db.save_guild_settings(
+                    guild_id=guild.id,
+                    staff_role_id=settings["staff_role_id"],
+                    ticket_category_id=settings["ticket_category_id"],
+                    archive_category_id=category.id,
+                    log_channel_id=settings.get("log_channel_id"),
+                    panel_channel_id=settings.get("panel_channel_id"),
+                    panel_message_id=settings.get("panel_message_id"),
+                )
+            return category
+
+    staff_role = guild.get_role(settings["staff_role_id"])
+    me = guild.me
+    if staff_role is None or me is None:
+        raise RuntimeError("Ankauf-Team-Rolle oder Bot-Mitglied nicht gefunden.")
+
+    # The original archive keeps its name; subsequent archives are numbered 2, 3, ...
+    used_numbers = {1}
+    pattern = re.compile(r"^📁 ANKAUF ARCHIV(?: (\d+))?$")
+    for category in archives:
+        match = pattern.match(category.name)
+        if match:
+            used_numbers.add(int(match.group(1) or "1"))
+    next_number = 2
+    while next_number in used_numbers:
+        next_number += 1
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+        staff_role: discord.PermissionOverwrite(view_channel=True, read_message_history=True),
+        me: discord.PermissionOverwrite(
+            view_channel=True,
+            manage_channels=True,
+            send_messages=True,
+            read_message_history=True,
+        ),
+    }
+    archive = await guild.create_category(
+        f"📁 ANKAUF ARCHIV {next_number}",
+        overwrites=overwrites,
+        reason="Smexycards Ankauf-Archiv automatisch erweitert",
+    )
+    db.save_guild_settings(
+        guild_id=guild.id,
+        staff_role_id=settings["staff_role_id"],
+        ticket_category_id=settings["ticket_category_id"],
+        archive_category_id=archive.id,
+        log_channel_id=settings.get("log_channel_id"),
+        panel_channel_id=settings.get("panel_channel_id"),
+        panel_message_id=settings.get("panel_message_id"),
+    )
+    return archive
+
+
 async def create_ticket_channel(
     interaction: discord.Interaction, kind: str, details: dict[str, str]
 ) -> None:
@@ -711,33 +787,63 @@ class TicketControlView(discord.ui.View):
         if not await require_staff(interaction):
             return
         ticket = await get_ticket_from_interaction(interaction)
-        if not ticket or not isinstance(interaction.channel, discord.TextChannel):
+        if not ticket or not isinstance(interaction.channel, discord.TextChannel) or not interaction.guild:
             await interaction.response.send_message("❌ Kein Ankauf-Ticket.", ephemeral=True)
             return
         settings = db.get_guild_settings(interaction.guild.id)
-        db.set_ticket_status(ticket["id"], "closed")
+        if not settings:
+            await interaction.response.send_message(
+                "❌ Die Ankauf-Konfiguration fehlt. Bitte `/ankauf_setup` erneut ausführen.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.response.send_message("🔒 Ticket wird geschlossen.", ephemeral=True)
 
-        owner = interaction.guild.get_member(ticket["owner_id"])
-        if owner:
-            await interaction.channel.set_permissions(
-                owner,
-                view_channel=True,
-                send_messages=False,
-                read_message_history=True,
-                attach_files=False,
+        try:
+            archive = await get_or_create_archive_category(interaction.guild, settings)
+
+            owner = interaction.guild.get_member(ticket["owner_id"])
+            if owner:
+                await interaction.channel.set_permissions(
+                    owner,
+                    view_channel=True,
+                    send_messages=False,
+                    read_message_history=True,
+                    attach_files=False,
+                    reason=f"Ankauf-Ticket #{ticket['id']:04d} geschlossen",
+                )
+
+            await interaction.channel.edit(
+                name=f"geschlossen-{ticket['id']:04d}",
+                category=archive,
                 reason=f"Ankauf-Ticket #{ticket['id']:04d} geschlossen",
             )
-        archive = None
-        if settings and settings.get("archive_category_id"):
-            archive = interaction.guild.get_channel(settings["archive_category_id"])
-        await interaction.channel.edit(
-            name=f"geschlossen-{ticket['id']:04d}",
-            category=archive if isinstance(archive, discord.CategoryChannel) else interaction.channel.category,
-            reason=f"Ankauf-Ticket #{ticket['id']:04d} geschlossen",
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Ich konnte das Ticket nicht archivieren. Bitte prüfe beim Bot **Kanäle verwalten**.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"❌ Discord hat das Archivieren abgelehnt (`{exc.code}`). Bitte schick mir die Railway-Logs, falls das erneut passiert.",
+                ephemeral=True,
+            )
+            return
+        except RuntimeError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+
+        db.set_ticket_status(ticket["id"], "closed")
+        await interaction.channel.send(
+            f"🔒 **Ticket geschlossen.** Der Verlauf bleibt zur Dokumentation sichtbar.\n📁 Archiv: **{archive.name}**"
         )
-        await interaction.channel.send("🔒 **Ticket geschlossen.** Der Verlauf bleibt zur Dokumentation sichtbar.")
-        await send_log(interaction.guild, "🔒 Ticket geschlossen", f"Ticket **#{ticket['id']:04d}**")
+        await send_log(
+            interaction.guild,
+            "🔒 Ticket geschlossen",
+            f"Ticket **#{ticket['id']:04d}** → **{archive.name}**",
+        )
 
 
 class OfferResponseView(discord.ui.View):
